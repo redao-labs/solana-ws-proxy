@@ -1,149 +1,212 @@
-import { WebSocketServer, WebSocket as WebSocketClient } from 'ws';
-require("dotenv").config();
+import uWS from 'uWebSockets.js';
+import { WebSocket as WsClient } from 'ws';
+import dotenv from 'dotenv-safe';
 
-const RPC_DOMAIN = process.env.SUBSCRIBE_DOMAIN;
-const WS_PROXY_PORT = Number(process.env.WS_PROXY_PORT);
+dotenv.config();
 
-let ws_client_lock: boolean;
-let global_proxy_id: number;
-let proxy_client_connextions: Map<number, ProxyConnection>;
-let server_proxy_subscriptions: Map<number, number>;
-let ws_client: WebSocketClient;
-let ws_server: WebSocketServer;
+const RPC_DOMAIN = process.env.SUBSCRIBE_DOMAIN as string; // e.g. "wss://..."
+const WS_PROXY_PORT = Number(process.env.WS_PROXY_PORT) || 9010;
 
-interface ProxyConnection {
-    client: WebSocketClient,
-    client_id: number,
-    proxy_id: number,
-    server_id: number
+/** Store the local data we want to associate with each WebSocket. */
+interface LocalClientData {
+  proxyIds: Set<number>;
 }
 
+interface ProxyConnection {
+    // Provide a dummy generic parameter, e.g. <unknown>.
+    client: uWS.WebSocket<unknown>;
+    client_id: number;
+    proxy_id: number;
+    server_id: number;
+  }
+
+// A WeakMap to associate each connected ws with its LocalClientData
+const localClientsMap = new WeakMap<uWS.WebSocket<unknown>, LocalClientData>();
+
+let ws_client_lock = false;
+let global_proxy_id = 0;
+let ws_client: WsClient | null = null;
+
+let proxy_client_connections = new Map<number, ProxyConnection>();
+let server_proxy_subscriptions = new Map<number, number>();
+
 function startNewWsProxy() {
-    createNewWsClient();
-    createNewWsServer();
+  createNewWsClient();
+  createNewWsServer();
 }
 
 function createNewWsClient() {
-    ws_client = new WebSocketClient(RPC_DOMAIN);
-    ws_client_lock = false;
-    global_proxy_id = 0;
-    proxy_client_connextions = new Map();
-    server_proxy_subscriptions = new Map();
-    addListenersWsClient(ws_client);
-}
-
-function addListenersWsClient(client: WebSocketClient) {
-    client.on('open', function open() {
-        console.debug("connected to rpc websocket node");
-        const heartbeatInterval = setInterval(() => {
-            const heartbeatMessage = JSON.stringify({
-              jsonrpc: '2.0',
-              method: 'ping',
-            });
-            client.send(heartbeatMessage);
-            console.debug('Heartbeat message sent');
-          }, 5000);
-        
-        client.on('close', function close() {
-            console.debug("client close");
-            ws_client_lock = false;
-            clearInterval(heartbeatInterval);
-            setTimeout(startNewWsProxy, 500);
-        });
-    
-        client.on('error', function error(err) {
-            console.error("client error", err);
-            ws_client_lock = false;
-            clearInterval(heartbeatInterval);
-            setTimeout(startNewWsProxy, 3000);
-        });
-
-        client.on('message', function message(server_data) {
-            let proxy_id;
-            console.debug('server_data %s', server_data.toString())
-            const sever_data_json = JSON.parse(server_data.toString());
-            if ("id" in sever_data_json && "result" in sever_data_json) {
-                const server_subscription = sever_data_json.result;
-                proxy_id = sever_data_json.id;    
-                server_proxy_subscriptions.set(server_subscription, proxy_id);
-                const proxy = proxy_client_connextions.get(proxy_id);
-                proxy.server_id = server_subscription;
-                // replace proxy_id with real client_id
-                // replace server_id with proxy_id
-                sever_data_json.id = proxy?.client_id;
-                sever_data_json.result = proxy?.proxy_id;
-                const proxy_data_str = JSON.stringify(sever_data_json);
-                console.debug('proxy_server_data %s', proxy_data_str)
-                proxy?.client.send(proxy_data_str);
-            } else if ("method" in sever_data_json && "params" in sever_data_json) {
-                const server_subscription = sever_data_json.params.subscription;
-                proxy_id = server_proxy_subscriptions.get(server_subscription);
-                if (proxy_id != undefined) {
-                    const proxy = proxy_client_connextions.get(proxy_id);
-                    // replace server_id with proxy_id
-                    sever_data_json.params.subscription = proxy?.proxy_id;
-                    const proxy_data_str = JSON.stringify(sever_data_json);
-                    console.debug('proxy_server_data %s', proxy_data_str)
-                    proxy?.client.send(proxy_data_str);
-                }
-            }
-        });
-    });
-    ws_client_lock = true;
-}
-
-function createNewWsServer() {
-    if (ws_server) {
-        ws_server.close();
+  if (ws_client) {
+    try {
+      ws_client.close();
+    } catch (err) {
+      // ignore
     }
-    ws_server = new WebSocketServer({ port: WS_PROXY_PORT });
-    ws_server.on('connection', function connection(ws) {
-        const proxy_ids = new Set<number>();
-        console.debug('New client connected');
-        ws.on('message', function message(client_data) {
-            console.debug('client_data: %s', client_data.toString());
-            const client_data_json = JSON.parse(client_data.toString());
-            if ("params" in client_data_json && "id" in client_data_json ) {
-                global_proxy_id = global_proxy_id + 1;
-                const cur_proxy_id = global_proxy_id;
-                proxy_ids.add(cur_proxy_id);
-                if (cur_proxy_id >= Number.MAX_SAFE_INTEGER) {
-                    ws_client.close(); // onclose callback will reconnect to rpc node
-                }
-                const proxy_connection: ProxyConnection = {
-                    client: ws,
-                    client_id: 0,
-                    proxy_id: 0,
-                    server_id: 0,
-                }
-                proxy_connection.client_id = client_data_json["id"];
-                proxy_connection.proxy_id = cur_proxy_id;
-                proxy_client_connextions.set(cur_proxy_id, proxy_connection);
-                // replace client_id with proxy_id
-                client_data_json["id"] = cur_proxy_id;
-                const proxy_data_str = JSON.stringify(client_data_json);
-                console.debug('proxy_client_data %s', proxy_data_str)
-                if (ws_client_lock) {
-                    ws_client.send(proxy_data_str);
-                }
-            }
-        });
-        ws.on('close', function close() {
-            cleanClientResources();
-        });
-        ws.on('error', function error(err) {
-            console.error("client error", err);
-            cleanClientResources();
-        });
-        function cleanClientResources() {
-            console.debug('cleanClientResources proxy_ids: ', proxy_ids)
-            for (let proxy_id of proxy_ids) {
-                let proxy_connection: ProxyConnection = proxy_client_connextions.get(proxy_id);
-                server_proxy_subscriptions.delete(proxy_connection.server_id)
-                proxy_client_connextions.delete(proxy_id);
-            }
-        }
+    ws_client = null;
+  }
+
+  ws_client = new WsClient(RPC_DOMAIN);
+  ws_client_lock = false;
+  global_proxy_id = 0;
+  proxy_client_connections = new Map();
+  server_proxy_subscriptions = new Map();
+
+  addListenersWsClient(ws_client);
+}
+
+function addListenersWsClient(client: WsClient) {
+  client.on('open', () => {
+    console.debug('Connected to RPC WebSocket node');
+    ws_client_lock = true;
+
+    const heartbeatInterval = setInterval(() => {
+      const heartbeatMessage = JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'ping',
+      });
+      client.send(heartbeatMessage);
+      console.debug('Heartbeat message sent');
+    }, 5000);
+
+    client.on('close', () => {
+      console.debug('RPC client connection closed');
+      ws_client_lock = false;
+      clearInterval(heartbeatInterval);
+      setTimeout(startNewWsProxy, 500);
     });
+
+    client.on('error', (err) => {
+      console.error('RPC client connection error:', err);
+      ws_client_lock = false;
+      clearInterval(heartbeatInterval);
+      setTimeout(startNewWsProxy, 3000);
+    });
+
+    client.on('message', (data: Buffer) => {
+      const msgStr = data.toString();
+      console.debug('Received from RPC:', msgStr);
+      const msg = JSON.parse(msgStr);
+
+      if ('id' in msg && 'result' in msg) {
+        // Subscription registration response
+        const server_subscription = msg.result;
+        const proxy_id = msg.id as number;
+        server_proxy_subscriptions.set(server_subscription, proxy_id);
+
+        const proxy = proxy_client_connections.get(proxy_id);
+        if (!proxy) return;
+
+        proxy.server_id = server_subscription;
+
+        // Rewrite to local client's original fields
+        msg.id = proxy.client_id;
+        msg.result = proxy.proxy_id;
+
+        const outStr = JSON.stringify(msg);
+        console.debug('Forward to local client:', outStr);
+        proxy.client.send(outStr);
+      } else if ('method' in msg && 'params' in msg) {
+        // Subscription update
+        const server_subscription = msg.params.subscription;
+        const proxy_id = server_proxy_subscriptions.get(server_subscription);
+        if (proxy_id !== undefined) {
+          const proxy = proxy_client_connections.get(proxy_id);
+          if (!proxy) return;
+
+          msg.params.subscription = proxy.proxy_id;
+          const outStr = JSON.stringify(msg);
+          console.debug('Forward subscription update:', outStr);
+          proxy.client.send(outStr);
+        }
+      }
+    });
+  });
+}
+
+/**
+ * Create the local uWebSockets.js server.
+ * Note: we do *not* specify a generic <T> here; instead we rely on our WeakMap
+ *       to store the user data, so TS doesn't complain about `ws.userData`.
+ */
+function createNewWsServer() {
+  const app = uWS.App({}).ws('/*', {
+    open: (ws) => {
+      // Initialize user data in the WeakMap
+      localClientsMap.set(ws, { proxyIds: new Set<number>() });
+      console.debug('New local WebSocket client connected.');
+    },
+
+    message: (ws, message, isBinary) => {
+      try {
+        const text = isBinary
+          ? Buffer.from(message).toString()
+          : new TextDecoder().decode(message);
+        console.debug('Received from local client:', text);
+
+        const client_data_json = JSON.parse(text);
+        if ('params' in client_data_json && 'id' in client_data_json) {
+          global_proxy_id++;
+          const cur_proxy_id = global_proxy_id;
+
+          // Grab the user data from the WeakMap
+          const userData = localClientsMap.get(ws);
+          if (!userData) {
+            console.error('No userData found for this client WebSocket');
+            return;
+          }
+
+          userData.proxyIds.add(cur_proxy_id);
+
+          if (cur_proxy_id >= Number.MAX_SAFE_INTEGER && ws_client) {
+            ws_client.close();
+          }
+
+          const proxy_connection: ProxyConnection = {
+            client: ws,
+            client_id: client_data_json.id,
+            proxy_id: cur_proxy_id,
+            server_id: 0,
+          };
+          proxy_client_connections.set(cur_proxy_id, proxy_connection);
+
+          client_data_json.id = cur_proxy_id;
+          const outStr = JSON.stringify(client_data_json);
+          console.debug('Forwarding to RPC node:', outStr);
+
+          if (ws_client_lock && ws_client) {
+            ws_client.send(outStr);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to handle local client message:', err);
+      }
+    },
+
+    close: (ws, code, message) => {
+      console.debug('Local client disconnected. Cleaning up resources.');
+
+      const userData = localClientsMap.get(ws);
+      if (userData) {
+        for (const proxy_id of userData.proxyIds) {
+          const proxy_connection = proxy_client_connections.get(proxy_id);
+          if (proxy_connection) {
+            server_proxy_subscriptions.delete(proxy_connection.server_id);
+            proxy_client_connections.delete(proxy_id);
+          }
+        }
+      }
+      // Clean up the WeakMap entry
+      localClientsMap.delete(ws);
+    },
+  });
+
+  app.listen(WS_PROXY_PORT, (token) => {
+    if (token) {
+      console.debug(`uWebSockets.js server listening on port ${WS_PROXY_PORT}`);
+    } else {
+      console.error(`Failed to listen on port ${WS_PROXY_PORT}`);
+    }
+  });
 }
 
 startNewWsProxy();
