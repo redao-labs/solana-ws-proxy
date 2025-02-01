@@ -13,12 +13,11 @@ interface LocalClientData {
 }
 
 interface ProxyConnection {
-    // Provide a dummy generic parameter, e.g. <unknown>.
-    client: uWS.WebSocket<unknown>;
-    client_id: number;
-    proxy_id: number;
-    server_id: number;
-  }
+  client: uWS.WebSocket<unknown>;
+  client_id: number;
+  proxy_id: number;
+  server_id: number;
+}
 
 // A WeakMap to associate each connected ws with its LocalClientData
 const localClientsMap = new WeakMap<uWS.WebSocket<unknown>, LocalClientData>();
@@ -28,7 +27,8 @@ let global_proxy_id = 0;
 let ws_client: WsClient | null = null;
 
 let proxy_client_connections = new Map<number, ProxyConnection>();
-let server_proxy_subscriptions = new Map<number, number>();
+// Change the mapping so that each server subscription id maps to a Set of proxy IDs.
+let server_proxy_subscriptions = new Map<number, Set<number>>();
 
 function startNewWsProxy() {
   createNewWsClient();
@@ -91,14 +91,18 @@ function addListenersWsClient(client: WsClient) {
         // Subscription registration response
         const server_subscription = msg.result;
         const proxy_id = msg.id as number;
-        server_proxy_subscriptions.set(server_subscription, proxy_id);
+        // Add the proxy_id to the set associated with this server subscription.
+        if (!server_proxy_subscriptions.has(server_subscription)) {
+          server_proxy_subscriptions.set(server_subscription, new Set());
+        }
+        server_proxy_subscriptions.get(server_subscription)!.add(proxy_id);
 
         const proxy = proxy_client_connections.get(proxy_id);
         if (!proxy) return;
 
         proxy.server_id = server_subscription;
 
-        // Rewrite to local client's original fields
+        // Rewrite to local client's original fields.
         msg.id = proxy.client_id;
         msg.result = proxy.proxy_id;
 
@@ -108,15 +112,20 @@ function addListenersWsClient(client: WsClient) {
       } else if ('method' in msg && 'params' in msg) {
         // Subscription update
         const server_subscription = msg.params.subscription;
-        const proxy_id = server_proxy_subscriptions.get(server_subscription);
-        if (proxy_id !== undefined) {
-          const proxy = proxy_client_connections.get(proxy_id);
-          if (!proxy) return;
+        const proxyIds = server_proxy_subscriptions.get(server_subscription);
+        if (proxyIds !== undefined) {
+          // Forward the update to every proxy connection for this subscription.
+          for (const proxy_id of proxyIds) {
+            const proxy = proxy_client_connections.get(proxy_id);
+            if (!proxy) continue;
 
-          msg.params.subscription = proxy.proxy_id;
-          const outStr = JSON.stringify(msg);
-          console.debug('Forward subscription update:', outStr);
-          proxy.client.send(outStr);
+            // Clone the message so that each client gets its own subscription ID.
+            const msgClone = JSON.parse(JSON.stringify(msg));
+            msgClone.params.subscription = proxy.proxy_id;
+            const outStr = JSON.stringify(msgClone);
+            console.debug('Forward subscription update:', outStr);
+            proxy.client.send(outStr);
+          }
         }
       }
     });
@@ -125,8 +134,6 @@ function addListenersWsClient(client: WsClient) {
 
 /**
  * Create the local uWebSockets.js server.
- * Note: we do *not* specify a generic <T> here; instead we rely on our WeakMap
- *       to store the user data, so TS doesn't complain about `ws.userData`.
  */
 function createNewWsServer() {
   const app = uWS.App({}).ws('/*', {
@@ -148,7 +155,7 @@ function createNewWsServer() {
           global_proxy_id++;
           const cur_proxy_id = global_proxy_id;
 
-          // Grab the user data from the WeakMap
+          // Retrieve the user data from the WeakMap.
           const userData = localClientsMap.get(ws);
           if (!userData) {
             console.error('No userData found for this client WebSocket');
@@ -190,12 +197,19 @@ function createNewWsServer() {
         for (const proxy_id of userData.proxyIds) {
           const proxy_connection = proxy_client_connections.get(proxy_id);
           if (proxy_connection) {
-            server_proxy_subscriptions.delete(proxy_connection.server_id);
+            // Remove this proxy_id from its corresponding server subscription set.
+            const subs = server_proxy_subscriptions.get(proxy_connection.server_id);
+            if (subs) {
+              subs.delete(proxy_id);
+              if (subs.size === 0) {
+                server_proxy_subscriptions.delete(proxy_connection.server_id);
+              }
+            }
             proxy_client_connections.delete(proxy_id);
           }
         }
       }
-      // Clean up the WeakMap entry
+      // Remove the entry from the WeakMap.
       localClientsMap.delete(ws);
     },
   });
